@@ -1,9 +1,9 @@
 # Lazio Gazzetta AI Automation
 
-Un controllo automatico ogni due ore sul canale [Paolo Colantoni - Dentro la Lazio](https://www.youtube.com/@PaoloColantoni). Quando esce un video nuovo, il programma recupera la trascrizione e usa l'API Gemini di Google per scrivere un riassunto giornalistico sportivo originale, con ritmo e struttura ispirati alla Gazzetta dello Sport. Salva ogni articolo come file Markdown nella cartella `articoli/` della repository.
+Un controllo automatico ogni due ore sul canale [Paolo Colantoni - Dentro la Lazio](https://www.youtube.com/@PaoloColantoni). Quando esce un video nuovo, il programma recupera la trascrizione e usa l'API Gemini di Google per scrivere un riassunto giornalistico sportivo originale, con ritmo e struttura ispirati alla Gazzetta dello Sport. Salva ogni articolo come file di testo semplice (`.txt`) nella cartella `articoli/` della repository.
 
 ```text
-Canale YouTube → GitHub Actions ogni 2 ore → trascrizione → Gemini → articoli/*.md
+Canale YouTube → GitHub Actions ogni 2 ore → trascrizione → Gemini → articoli/*.txt
 ```
 
 Il workflow viene eseguito sui server di GitHub: il computer può restare spento. Per avviarlo non servono plugin, controllo browser o Codex CLI.
@@ -13,7 +13,7 @@ Il workflow viene eseguito sui server di GitHub: il computer può restare spento
 1. Carica il progetto sul branch predefinito di una repository GitHub. Per usare gratuitamente i runner standard senza consumare la quota delle repository private, usa una repository pubblica.
 2. In **Settings → Secrets and variables → Actions → Secrets**, crea il secret **`GEMINI_API_KEY`** con la tua chiave Google di un progetto nel piano gratuito. Il canale è già configurato.
 3. Consenti al workflow di scrivere nella repository in **Settings → Actions → General → Workflow permissions**, nel rispetto delle regole del tuo account e del branch.
-4. Vai in **Actions → Automazione Articoli Lazio → Run workflow**. Puoi selezionare `dry_run` per provare il controllo senza usare quota Gemini.
+4. Vai in **Actions → Automazione Articoli Lazio → Run workflow**. Puoi selezionare `dry_run` per provare il controllo senza usare quota Gemini e scegliere `max_videos` per limitare le generazioni manuali.
 
 Da quel momento GitHub controlla automaticamente il canale ogni due ore e committa articoli e stato. Il cron è `17 */2 * * *`, cioè al minuto 17 degli orari UTC pari. La pianificazione deve trovarsi sul branch predefinito; GitHub può ritardare gli avvii.
 
@@ -30,14 +30,16 @@ La gratuità dipende dal piano del progetto associato alla chiave, dalla disponi
 ## Come vengono scritti gli articoli
 
 - Si leggono tutti i video recenti presenti nel feed. Quelli già elaborati vengono saltati; per esecuzione si tentano al massimo tre generazioni, dai video più vecchi ancora da elaborare.
-- Gemini riceve la trascrizione, insieme a istruzioni per titolo incisivo, occhiello, catenaccio, sottotitoli e circa 400–650 parole quando la fonte lo consente.
-- L'articolo deve sintetizzare ciò che viene detto, attribuire opinioni e indiscrezioni a Colantoni e non inventare risultati, nomi, numeri o citazioni.
+- Gemini riceve la trascrizione, insieme a istruzioni per titolo incisivo, sommario e paragrafi ben costruiti e circa 400–650 parole quando la fonte lo consente.
+- L'articolo deve sintetizzare ciò che viene detto, mantenere al condizionale le notizie non confermate, distinguere analisi e fatti e non inventare risultati, nomi, numeri o citazioni.
 - L'articolo è originale e non viene presentato come un contenuto ufficiale della Gazzetta dello Sport.
-- Ogni file include data, modello, video sorgente, link alla fonte e `status: draft`. Le bozze vanno controllate prima di un'eventuale pubblicazione.
+- Ogni file contiene esclusivamente titolo, sommario e corpo dell'articolo in testo semplice. Non include nomi del canale o dell'autore, riferimenti a YouTube, link, firme, metadati, formattazione Markdown o note finali. Il testo va controllato prima di un'eventuale pubblicazione.
 - Se mancano i sottotitoli, il video resta in attesa e non blocca gli altri. Non si genera un articolo dal solo titolo.
-- Se YouTube blocca l'IP del runner durante il recupero dei sottotitoli, il programma può inviare a Gemini l'URL del video pubblico perché ne analizzi il parlato. I metadati distinguono `transcript` da `youtube_video`. Questa funzione Google è in anteprima e soggetta a quote, disponibilità e possibili modifiche; non ne viene garantito il successo. [Input YouTube per Gemini](https://ai.google.dev/gemini-api/docs/video-understanding#youtube).
+- Se YouTube blocca l'IP del runner durante il recupero dei sottotitoli, il programma può inviare a Gemini l'URL del video pubblico perché ne analizzi il parlato. Questa funzione Google è in anteprima e soggetta a quote, disponibilità e possibili modifiche; non ne viene garantito il successo. [Input YouTube per Gemini](https://ai.google.dev/gemini-api/docs/video-understanding#youtube).
 - L'analisi del video diretto usa l'API **Interactions**, con input YouTube nativo, ragionamento `low` e `store=false`. Il testo dei sottotitoli continua a usare `generateContent`. Si accettano soltanto risposte complete contenenti un articolo; gli errori API mantengono il codice HTTP nei log e i video falliti restano da elaborare. Ogni video ha un singolo tentativo API con timeout di tre minuti: eventuali errori verranno ritentati al controllo successivo, senza moltiplicare le chiamate dentro l'SDK.
 - Errori parziali non cancellano gli articoli riusciti. Articoli e stato vengono salvati con sostituzione atomica; dopo un'interruzione si recuperano i file già presenti senza rigenerarli.
+
+Il testo generato viene validato prima del salvataggio: nomi del canale e dell'autore, riferimenti al contenuto sorgente e URL fanno rifiutare l'articolo. Il relativo ID rimane da elaborare, così un output non conforme non viene archiviato come riuscito. I quattro articoli iniziali sono stati rielaborati nel nuovo formato; gli ID già elaborati sono conservati.
 
 Alla prima esecuzione si considerano anche i video già presenti nel feed, entro il limite di generazione. Non viene scaricato lo storico completo: i video che escono dalla finestra del feed non sono recuperabili da questo controllo.
 
@@ -45,11 +47,11 @@ Alla prima esecuzione si considerano anche i video già presenti nel feed, entro
 
 ```text
 articoli/
-└── ID_VIDEO_titolo-del-video.md
+└── ID_VIDEO_titolo-del-video.txt
 processed_videos.txt                ID dei video già trasformati in articoli
 ```
 
-Gli articoli vengono salvati nella repository GitHub. Per ritrovarli anche nella copia locale del progetto esegui `git pull` dopo aver collegato la repository. Per rigenerare un articolo elimina sia il suo file `.md` sia l'ID da `processed_videos.txt`.
+Gli articoli vengono salvati nella repository GitHub. Per ritrovarli anche nella copia locale del progetto esegui `git pull` dopo aver collegato la repository. Per rigenerare un articolo elimina sia il suo file `.txt` sia l'ID da `processed_videos.txt`.
 
 ## Configurazione
 
@@ -91,6 +93,6 @@ ruff format --check .
 python -m unittest discover -s tests -v
 ```
 
-I test usano file temporanei e provider simulati: non consumano quota API. Coprono feed, deduplicazione, errori, sottotitoli assenti, input video alternativo, quote Gemini e recupero dopo interruzioni. Il workflow `Test` esegue questi controlli su push e pull request. La generazione reale richiede una chiave valida e va verificata anche sul runner GitHub.
+I test usano file temporanei e provider simulati: non consumano quota API. Coprono feed, deduplicazione, errori, sottotitoli assenti, input video alternativo, quote Gemini, formato .txt, assenza di riferimenti alla sorgente e recupero dopo interruzioni. Il workflow `Test` esegue questi controlli su push e pull request. La generazione reale richiede una chiave valida e va verificata anche sul runner GitHub.
 
 La specifica iniziale resta in `progetto-antigravity.md`. L'implementazione usa l'[SDK Google GenAI mantenuto](https://ai.google.dev/gemini-api/docs/libraries) e l'API a istanze `YouTubeTranscriptApi().fetch(...)`.

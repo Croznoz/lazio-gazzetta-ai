@@ -16,7 +16,10 @@ import app
 V1 = app.Video("aaaaaaaaaaa", 'Lazio: novità "in campo"', "2026-11-03T10:00:00Z")
 V2 = app.Video("bbbbbbbbbbb", "Analisi della partita", "2026-11-04T10:00:00Z")
 V3 = app.Video("ccccccccccc", "Nuovo allenamento")
-ARTICLE = "# Lazio, segnali dal campo\n\n" + "Un'analisi attribuita alla fonte. " * 10
+ARTICLE = (
+    "Lazio, segnali dal campo\n\n"
+    + "La squadra cerca continuità attraverso il lavoro tattico. " * 8
+)
 FEED = b"""<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:yt="http://www.youtube.com/xml/schemas/2015">
 <title>Dentro la Lazio</title>
@@ -112,7 +115,8 @@ class PipelineTests(unittest.TestCase):
 
     def test_batch_is_saved_and_rerun_does_not_call_providers(self):
         self.assertEqual(app.run(self.config), 0)
-        self.assertEqual(len(list(self.config.output_dir.glob("*.md"))), 3)
+        self.assertEqual(len(list(self.config.output_dir.glob("*.txt"))), 3)
+        self.assertEqual(list(self.config.output_dir.glob("*.md")), [])
         self.assertEqual(
             app.load_processed(self.config.processed_file), {V1.video_id, V2.video_id, V3.video_id}
         )
@@ -186,7 +190,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(app.run(self.config), 0)
         self.generate.assert_called_once_with(V1, None, self.config)
         path = app.article_path(self.config.output_dir, V1)
-        self.assertIn('source_type: "youtube_video"', path.read_text(encoding="utf-8"))
+        self.assertEqual(path.read_text(encoding="utf-8"), ARTICLE.strip() + "\n")
         self.assertEqual(app.load_processed(self.config.processed_file), {V1.video_id})
 
     def test_video_fallback_can_be_disabled(self):
@@ -227,7 +231,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_recover_existing_file_after_title_change_without_key(self):
         self.feed.return_value = [V1]
-        app.atomic_write(self.config.output_dir / f"{V1.video_id}_vecchio-titolo.md", ARTICLE)
+        app.atomic_write(self.config.output_dir / f"{V1.video_id}_vecchio-titolo.txt", ARTICLE)
         config = app.Config(
             self.config.feed_url,
             output_dir=self.config.output_dir,
@@ -254,17 +258,64 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(app.run(self.config), 1)
         self.assertFalse(self.config.processed_file.exists())
 
-    def test_filename_cannot_escape_output_and_metadata_handles_quotes(self):
+    def test_filename_cannot_escape_output_and_file_contains_only_article(self):
         video = app.Video(V1.video_id, '../../Làzio: "novità"\n---')
         path = app.article_path(self.config.output_dir, video)
         self.assertEqual(path.parent, self.config.output_dir)
-        import yaml
+        self.assertEqual(path.suffix, ".txt")
+        rendered = app.render_article(ARTICLE)
+        self.assertEqual(rendered, ARTICLE.strip() + "\n")
+        self.assertNotIn(video.url, rendered)
+        self.assertNotIn("source_", rendered)
 
-        rendered = app.render_article(video, ARTICLE, self.config.model)
-        metadata = yaml.safe_load(rendered.split("---\n", 2)[1])
-        self.assertEqual(metadata["source_title"], video.title)
-        self.assertEqual(metadata["status"], "draft")
-        self.assertIn(video.url, rendered)
+    def test_source_reference_is_rejected_before_writing_or_marking_processed(self):
+        self.feed.return_value = [V1]
+        self.generate.return_value = ARTICLE + "\n\nSecondo Paolo Colantoni la squadra è pronta."
+        self.assertEqual(app.run(self.config), 1)
+        self.assertFalse(self.config.processed_file.exists())
+        self.assertFalse(self.config.output_dir.exists())
+
+
+class ArticleTextTests(unittest.TestCase):
+    def test_source_names_are_removed_from_filename(self):
+        video = app.Video(V1.video_id, "Paolo Colantoni - Dentro la Lazio: partita e analisi")
+        name = app.article_path(Path("articoli"), video).name
+        self.assertNotIn("paolo", name)
+        self.assertNotIn("colantoni", name)
+        self.assertNotIn("dentro-la-lazio", name)
+
+    def test_markdown_formatting_is_normalized_to_plain_text(self):
+        article = (
+            "```text\n# Lazio, segnali dal campo\n\n**Squadra compatta**\n\n*"
+            + "La squadra cerca continuità. " * 8
+            + "*\n```"
+        )
+        text = app.prepare_article(article)
+        self.assertTrue(text.startswith("Lazio, segnali dal campo\n\n"))
+        for marker in ("#", "*", "```"):
+            self.assertNotIn(marker, text)
+
+    def test_forbidden_source_references_are_rejected(self):
+        for reference in (
+            "Paolo Colantoni",
+            "COLANTONI",
+            "Dentro la Lazio",
+            "Dentro\nla Lazio",
+            "YouTube",
+            "https://example.com",
+            "nel video",
+            "dal video",
+            "la trascrizione",
+            "il canale",
+            "youtu.be/example",
+        ):
+            with self.subTest(reference=reference), self.assertRaises(ValueError):
+                app.prepare_article(ARTICLE + "\n\n" + reference)
+
+    def test_metadata_and_unstructured_outputs_are_rejected(self):
+        for text in ("---\nsource_url: example\n---\n\n" + ARTICLE, "Titolo breve", "x" * 200):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                app.prepare_article(text)
 
 
 class ProviderTests(unittest.TestCase):
