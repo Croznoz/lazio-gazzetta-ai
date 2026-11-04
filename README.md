@@ -23,7 +23,7 @@ Se il branch impone pull request obbligatorie, occorre adattare il salvataggio a
 
 I runner standard di GitHub Actions sono gratuiti nelle repository pubbliche; per quelle private valgono le risorse incluse e le condizioni del piano. Non vengono caricati artifact di Actions: gli articoli sono normali file Git. [Condizioni GitHub](https://docs.github.com/en/billing/concepts/product-billing/github-actions).
 
-Il modello predefinito è **`gemini-3.8-flash`**, che risulta incluso nel Free Tier della Gemini API alla verifica del 4 novembre 2026. Il precedente 2.5 Flash della specifica è deprecato. Il modello si può cambiare con `GEMINI_MODEL`; non vengono selezionati automaticamente modelli alternativi. [Prezzi e modelli Google](https://ai.google.dev/gemini-api/docs/pricing).
+Il modello predefinito è **`gemini-3.5-flash-lite`**, incluso nel Free Tier della Gemini API alla verifica del 4 novembre 2026 e verificato con una generazione reale da video YouTube. Il modello si può cambiare con `GEMINI_MODEL`; non vengono selezionati automaticamente modelli alternativi. [Prezzi e modelli Google](https://ai.google.dev/gemini-api/docs/pricing#gemini-3.5-flash-lite).
 
 La gratuità dipende dal piano del progetto associato alla chiave, dalla disponibilità del modello e dalle quote Google. Il codice non attiva billing, abbonamenti o passaggi a piani a pagamento e non può verificare o modificare il piano di fatturazione della chiave. Usa una chiave di un progetto Free Tier per restare nel piano gratuito. Se Google risponde con quota esaurita (HTTP 429), l'esecuzione interrompe le chiamate Gemini e riprova al controllo successivo. Non sono richiesti servizi di trascrizione a pagamento.
 
@@ -36,7 +36,7 @@ La gratuità dipende dal piano del progetto associato alla chiave, dalla disponi
 - Ogni file include data, modello, video sorgente, link alla fonte e `status: draft`. Le bozze vanno controllate prima di un'eventuale pubblicazione.
 - Se mancano i sottotitoli, il video resta in attesa e non blocca gli altri. Non si genera un articolo dal solo titolo.
 - Se YouTube blocca l'IP del runner durante il recupero dei sottotitoli, il programma può inviare a Gemini l'URL del video pubblico perché ne analizzi il parlato. I metadati distinguono `transcript` da `youtube_video`. Questa funzione Google è in anteprima e soggetta a quote, disponibilità e possibili modifiche; non ne viene garantito il successo. [Input YouTube per Gemini](https://ai.google.dev/gemini-api/docs/video-understanding#youtube).
-- L'analisi del video diretto usa l'API **Interactions**, con input YouTube nativo e `store=false`. Il testo dei sottotitoli continua a usare `generateContent`. Si accettano soltanto risposte complete contenenti un articolo; gli errori API mantengono il codice HTTP nei log e i video falliti restano da elaborare. Il timeout delle richieste è di tre minuti.
+- L'analisi del video diretto usa l'API **Interactions**, con input YouTube nativo, ragionamento `low` e `store=false`. Il testo dei sottotitoli continua a usare `generateContent`. Si accettano soltanto risposte complete contenenti un articolo; gli errori API mantengono il codice HTTP nei log e i video falliti restano da elaborare. Ogni video ha un singolo tentativo API con timeout di tre minuti: eventuali errori verranno ritentati al controllo successivo, senza moltiplicare le chiamate dentro l'SDK.
 - Errori parziali non cancellano gli articoli riusciti. Articoli e stato vengono salvati con sostituzione atomica; dopo un'interruzione si recuperano i file già presenti senza rigenerarli.
 
 Alla prima esecuzione si considerano anche i video già presenti nel feed, entro il limite di generazione. Non viene scaricato lo storico completo: i video che escono dalla finestra del feed non sono recuperabili da questo controllo.
@@ -60,7 +60,7 @@ In GitHub aggiungi le personalizzazioni in **Settings → Secrets and variables 
 | `GEMINI_API_KEY` | — | Secret necessario per generare articoli |
 | `YOUTUBE_CHANNEL_ID` | `UCWOuIQE2PPdTDb_CEeaoqDA` | Canale di Paolo Colantoni |
 | `YOUTUBE_FEED_URL` | Feed derivato dall'ID | Feed RSS completo, prevale sull'ID |
-| `GEMINI_MODEL` | `gemini-3.8-flash` | Modello Google da usare |
+| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Modello Google da usare |
 | `MAX_VIDEOS_PER_RUN` | `3` | Massimo di generazioni tentate per controllo, da 1 a 50 |
 | `TRANSCRIPT_LANGUAGES` | `it` | Lingue dei sottotitoli, in ordine di preferenza |
 | `YOUTUBE_VIDEO_FALLBACK` | `true` | Prova il video pubblico con Gemini se YouTube blocca i sottotitoli |

@@ -283,6 +283,8 @@ class ProviderTests(unittest.TestCase):
             self.assertEqual(request["system_instruction"], app.SYSTEM_PROMPT)
             self.assertEqual(request["model"], app.DEFAULT_MODEL)
             self.assertFalse(request["store"])
+            self.assertEqual(request["generation_config"]["thinking_level"], "low")
+            self.assertEqual(client.call_args.kwargs["http_options"].retry_options.attempts, 1)
             api.models.generate_content.assert_not_called()
 
     def test_video_response_must_be_completed_and_contain_an_article(self):

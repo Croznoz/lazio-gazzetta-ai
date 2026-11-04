@@ -33,7 +33,7 @@ from youtube_transcript_api.proxies import GenericProxyConfig
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CHANNEL_ID = "UCWOuIQE2PPdTDb_CEeaoqDA"
-DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 LOG = logging.getLogger("lazio")
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}\Z")
 CHANNEL_ID = re.compile(r"UC[A-Za-z0-9_-]{22}\Z")
@@ -233,7 +233,10 @@ def generate_article(video: Video, transcript: str | None, config: Config) -> st
         {"titolo_video": video.title, "trascrizione": transcript}, ensure_ascii=False
     )
     with genai.Client(
-        api_key=config.api_key, http_options=types.HttpOptions(timeout=180_000)
+        api_key=config.api_key,
+        http_options=types.HttpOptions(
+            timeout=180_000, retry_options=types.HttpRetryOptions(attempts=1)
+        ),
     ) as client:
         if transcript is None:
             # L'input YouTube usa l'endpoint Interactions documentato da Google:
@@ -256,7 +259,7 @@ def generate_article(video: Video, transcript: str | None, config: Config) -> st
                         {"type": "video", "uri": video.url},
                     ],
                     system_instruction=SYSTEM_PROMPT,
-                    generation_config={"max_output_tokens": 8192},
+                    generation_config={"max_output_tokens": 4096, "thinking_level": "low"},
                     store=False,
                     timeout=180,
                 )
