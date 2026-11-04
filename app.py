@@ -232,34 +232,67 @@ def generate_article(video: Video, transcript: str | None, config: Config) -> st
     contents = json.dumps(
         {"titolo_video": video.title, "trascrizione": transcript}, ensure_ascii=False
     )
-    if transcript is None:
-        contents = [
-            types.Part.from_text(
-                text=(
-                    "Il recupero dei sottotitoli è stato bloccato. Usa il video allegato come "
-                    "fonte: ascolta il parlato italiano e riassumine i temi in un articolo. "
-                    "Non dedurre il contenuto dal solo titolo. Se il video non è accessibile "
-                    "o il parlato non è comprensibile, rispondi FONTE_NON_DISPONIBILE.\n"
-                    + json.dumps({"titolo_video": video.title}, ensure_ascii=False)
-                )
-            ),
-            types.Part.from_uri(file_uri=video.url, mime_type="video/mp4"),
-        ]
     with genai.Client(
-        api_key=config.api_key, http_options=types.HttpOptions(timeout=120_000)
+        api_key=config.api_key, http_options=types.HttpOptions(timeout=180_000)
     ) as client:
-        response = client.models.generate_content(
-            model=config.model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0.5,
-                max_output_tokens=8192,
-            ),
-        )
-    if not response.candidates or response.candidates[0].finish_reason != types.FinishReason.STOP:
-        raise ValueError("Gemini non ha completato l'articolo; il video resta da elaborare.")
-    article = (response.text or "").strip()
+        if transcript is None:
+            # L'input YouTube usa l'endpoint Interactions documentato da Google:
+            # l'URL è un video, senza dichiararlo come un file MP4 scaricato.
+            try:
+                response = client.interactions.create(
+                    model=config.model,
+                    input=[
+                        {
+                            "type": "text",
+                            "text": (
+                                "Il recupero dei sottotitoli è stato bloccato. Usa il video "
+                                "allegato come fonte: ascolta il parlato italiano e riassumine "
+                                "i temi in un articolo. Non dedurre il contenuto dal solo titolo. "
+                                "Se il video non è accessibile o il parlato non è comprensibile, "
+                                "rispondi FONTE_NON_DISPONIBILE.\n"
+                                + json.dumps({"titolo_video": video.title}, ensure_ascii=False)
+                            ),
+                        },
+                        {"type": "video", "uri": video.url},
+                    ],
+                    system_instruction=SYSTEM_PROMPT,
+                    generation_config={"max_output_tokens": 8192},
+                    store=False,
+                    timeout=180,
+                )
+            except Exception as exc:
+                # Interactions espone status_code, generateContent usa code.
+                # Uniforma anche il 429 senza riportare messaggi o URL del provider.
+                status = getattr(exc, "status_code", None)
+                if isinstance(status, int) and 400 <= status < 600:
+                    error_type = errors.ClientError if status < 500 else errors.ServerError
+                    raise error_type(
+                        status,
+                        {"error": {"code": status, "message": "Richiesta video Gemini fallita."}},
+                    ) from None
+                raise
+            if response.status != "completed":
+                raise ValueError(
+                    "Gemini non ha completato l'articolo; il video resta da elaborare."
+                )
+            article = (response.output_text or "").strip()
+        else:
+            response = client.models.generate_content(
+                model=config.model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    max_output_tokens=8192,
+                ),
+            )
+            if (
+                not response.candidates
+                or response.candidates[0].finish_reason != types.FinishReason.STOP
+            ):
+                raise ValueError(
+                    "Gemini non ha completato l'articolo; il video resta da elaborare."
+                )
+            article = (response.text or "").strip()
     if not article.startswith("# ") or len(article) < 100:
         raise ValueError("Gemini ha restituito un articolo vuoto o in formato inatteso.")
     return article
@@ -341,6 +374,13 @@ def run(config: Config, *, dry_run: bool = False) -> int:
                 failed += 1
                 break
             LOG.error("%s: richiesta Gemini rifiutata (HTTP %s).", video.video_id, exc.code)
+            failed += 1
+        except errors.ServerError as exc:
+            LOG.error(
+                "%s: errore server Gemini (HTTP %s). Il video resta da elaborare.",
+                video.video_id,
+                exc.code,
+            )
             failed += 1
         except Exception as exc:
             # Le eccezioni dei provider possono contenere URL con credenziali: registra solo il tipo.

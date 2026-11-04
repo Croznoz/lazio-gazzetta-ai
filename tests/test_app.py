@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from google.genai import types
+from google.genai import interactions, types
 from youtube_transcript_api import TranscriptsDisabled
 
 import app
@@ -213,6 +213,18 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self.generate.call_count, 2)
         self.assertEqual(app.load_processed(self.config.processed_file), {V1.video_id})
 
+    def test_server_error_reports_http_status_without_leaking_provider_message(self):
+        self.generate.side_effect = [
+            app.errors.ServerError(503, {"error": {"code": 503, "message": "private-key"}}),
+            ARTICLE,
+            ARTICLE,
+        ]
+        with self.assertLogs("lazio", "INFO") as logs:
+            self.assertEqual(app.run(self.config), 1)
+        self.assertIn("HTTP 503", " ".join(logs.output))
+        self.assertNotIn("private-key", " ".join(logs.output))
+        self.assertEqual(app.load_processed(self.config.processed_file), {V2.video_id, V3.video_id})
+
     def test_recover_existing_file_after_title_change_without_key(self):
         self.feed.return_value = [V1]
         app.atomic_write(self.config.output_dir / f"{V1.video_id}_vecchio-titolo.md", ARTICLE)
@@ -256,23 +268,57 @@ class PipelineTests(unittest.TestCase):
 
 
 class ProviderTests(unittest.TestCase):
-    def test_video_fallback_sends_actual_file_uri_not_just_title(self):
+    def test_video_fallback_uses_interactions_with_actual_youtube_input(self):
         config = app.Config("https://example.invalid", "test-key")
         with patch.object(app.genai, "Client") as client:
-            model = client.return_value.__enter__.return_value.models.generate_content
-            model.return_value = types.GenerateContentResponse(
-                candidates=[
-                    types.Candidate(
-                        finish_reason=types.FinishReason.STOP,
-                        content=types.Content(parts=[types.Part(text=ARTICLE)]),
-                    )
-                ]
+            api = client.return_value.__enter__.return_value
+            api.interactions.create.return_value = interactions.Interaction(
+                status="completed",
+                steps=[{"type": "model_output", "content": [{"type": "text", "text": ARTICLE}]}],
             )
             self.assertEqual(app.generate_article(V1, None, config), ARTICLE.strip())
-            parts = model.call_args.kwargs["contents"]
-            self.assertEqual(parts[1].file_data.file_uri, V1.url)
-            self.assertEqual(parts[1].file_data.mime_type, "video/mp4")
-            self.assertIn("FONTE_NON_DISPONIBILE", parts[0].text)
+            request = api.interactions.create.call_args.kwargs
+            self.assertEqual(request["input"][1], {"type": "video", "uri": V1.url})
+            self.assertIn("FONTE_NON_DISPONIBILE", request["input"][0]["text"])
+            self.assertEqual(request["system_instruction"], app.SYSTEM_PROMPT)
+            self.assertEqual(request["model"], app.DEFAULT_MODEL)
+            self.assertFalse(request["store"])
+            api.models.generate_content.assert_not_called()
+
+    def test_video_response_must_be_completed_and_contain_an_article(self):
+        with patch.object(app.genai, "Client") as client:
+            create = client.return_value.__enter__.return_value.interactions.create
+            for status, text in (
+                ("in_progress", ARTICLE),
+                ("failed", ""),
+                ("completed", "FONTE_NON_DISPONIBILE"),
+                ("completed", ""),
+            ):
+                with self.subTest(status=status, text=text):
+                    create.return_value = interactions.Interaction(
+                        status=status,
+                        steps=[
+                            {"type": "model_output", "content": [{"type": "text", "text": text}]}
+                        ],
+                    )
+                    with self.assertRaises(ValueError):
+                        app.generate_article(V1, None, app.Config("", "key"))
+
+    def test_interactions_http_errors_preserve_quota_and_server_status(self):
+        class InteractionError(Exception):
+            def __init__(self, status):
+                super().__init__("private-provider-message")
+                self.status_code = status
+
+        with patch.object(app.genai, "Client") as client:
+            create = client.return_value.__enter__.return_value.interactions.create
+            for status, expected in ((429, app.errors.ClientError), (503, app.errors.ServerError)):
+                with self.subTest(status=status):
+                    create.side_effect = InteractionError(status)
+                    with self.assertRaises(expected) as caught:
+                        app.generate_article(V1, None, app.Config("", "key"))
+                    self.assertEqual(caught.exception.code, status)
+                    self.assertNotIn("private-provider-message", str(caught.exception))
 
     def test_current_transcript_api_and_unavailable_subtitles(self):
         config = app.Config("https://example.invalid")
