@@ -1,0 +1,60 @@
+name: Automazione Articoli Lazio
+
+on:
+  schedule:
+    - cron: '17 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Controlla i nuovi video senza generare articoli o usare quota Gemini'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lazio-articles
+  cancel-in-progress: false
+
+jobs:
+  run-automation:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+          cache: pip
+      - name: Installa dipendenze
+        run: python -m pip install -r requirements.txt
+      - name: Genera articoli
+        id: generate
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YOUTUBE_PROXY_URL: ${{ secrets.YOUTUBE_PROXY_URL }}
+          YOUTUBE_CHANNEL_ID: ${{ vars.YOUTUBE_CHANNEL_ID || 'UCWOuIQE2PPdTDb_CEeaoqDA' }}
+          YOUTUBE_FEED_URL: ${{ vars.YOUTUBE_FEED_URL }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.8-flash' }}
+          MAX_VIDEOS_PER_RUN: ${{ vars.MAX_VIDEOS_PER_RUN || '3' }}
+          TRANSCRIPT_LANGUAGES: ${{ vars.TRANSCRIPT_LANGUAGES || 'it' }}
+          YOUTUBE_VIDEO_FALLBACK: ${{ vars.YOUTUBE_VIDEO_FALLBACK || 'true' }}
+        run: python app.py ${{ inputs.dry_run && '--dry-run' || '' }}
+      - name: Salva articoli e stato anche in caso di errore parziale
+        if: ${{ !cancelled() && steps.generate.outcome != 'skipped' }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- articoli processed_videos.txt
+          if git diff --cached --quiet; then
+            echo 'Nessun nuovo articolo da salvare.'
+            exit 0
+          fi
+          git commit -m 'Auto: nuovi articoli Lazio e aggiornamento stato'
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push origin "HEAD:$GITHUB_REF_NAME"

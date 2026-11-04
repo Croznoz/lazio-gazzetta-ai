@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+.venv/
+.tools/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+dist/
+.DS_Store
+*.tmp

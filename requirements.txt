@@ -1,0 +1,6 @@
+--only-binary=cryptography
+feedparser==6.0.14
+youtube-transcript-api==1.2.4
+google-genai==2.34.0
+requests==2.34.2
+python-dotenv==1.2.4
