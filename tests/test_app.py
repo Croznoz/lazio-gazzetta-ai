@@ -356,6 +356,9 @@ class ArticleIndexTests(unittest.TestCase):
         self.assertFalse(old.exists())
         self.assertEqual(path.read_text(), ARTICLE)
         self.assertTrue(app.existing_article(self.root, V1.video_id))
+        entry = app.load_index(self.root)[V1.video_id]
+        self.assertEqual(entry["titolo_video"], "")
+        self.assertEqual(entry["titolo_articolo"], ARTICLE.splitlines()[0])
 
     def test_index_rejects_path_traversal_and_duplicate_numbers(self):
         for index in (
