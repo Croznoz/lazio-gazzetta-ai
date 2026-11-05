@@ -9,11 +9,14 @@ import json
 import logging
 import os
 import re
+import subprocess
 import tempfile
-import unicodedata
+import time
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import feedparser
 import requests
@@ -36,6 +39,8 @@ DEFAULT_MODEL = "gemini-3.5-flash-lite"
 LOG = logging.getLogger("lazio")
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}\Z")
 CHANNEL_ID = re.compile(r"UC[A-Za-z0-9_-]{22}\Z")
+ARTICLE_NAME = re.compile(r"(\d{4,})-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.txt\Z")
+ROME = ZoneInfo("Europe/Rome")
 SOURCE_NAMES = re.compile(r"(?:paolo[\s_-]*)?colantoni|dentro[\s_-]+la[\s_-]+lazio", re.IGNORECASE)
 SOURCE_REFERENCES = re.compile(
     r"youtube|youtu\.be|https?://|\b(?:trascrizion\w*|canale|video)\b",
@@ -81,6 +86,7 @@ class Config:
     output_dir: Path = ROOT / "articoli"
     processed_file: Path = ROOT / "processed_videos.txt"
     video_fallback: bool = True
+    min_generation_interval: float = 60
 
     @classmethod
     def from_env(cls) -> Config:
@@ -121,6 +127,9 @@ class Config:
         fallback = os.getenv("YOUTUBE_VIDEO_FALLBACK", "true").strip().lower()
         if fallback not in {"true", "false"}:
             raise ValueError("YOUTUBE_VIDEO_FALLBACK deve essere true o false.")
+        interval = float(os.getenv("MIN_GENERATION_INTERVAL_SECONDS", "60"))
+        if not 0 <= interval <= 120:
+            raise ValueError("MIN_GENERATION_INTERVAL_SECONDS deve essere compreso tra 0 e 120.")
         return cls(
             feed_url,
             os.getenv("GEMINI_API_KEY", "").strip(),
@@ -129,6 +138,7 @@ class Config:
             languages,
             proxy,
             video_fallback=fallback == "true",
+            min_generation_interval=interval,
         )
 
 
@@ -206,14 +216,96 @@ def mark_processed(path: Path, processed: set[str], video_id: str) -> None:
     processed.add(video_id)
 
 
-def article_path(output_dir: Path, video: Video) -> Path:
-    title = SOURCE_NAMES.sub("", video.title)
-    title = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode()
-    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:80].rstrip("-") or "lazio"
-    return output_dir / f"{video.video_id}_{slug}.txt"
+def load_index(output_dir: Path) -> dict:
+    path = output_dir / "indice.json"
+    index = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    if not isinstance(index, dict):
+        raise ValueError("Indice articoli non valido.")
+    names = set()
+    numbers = set()
+    for video_id, item in index.items():
+        if not VIDEO_ID.fullmatch(video_id) or not isinstance(item, dict):
+            raise ValueError("Indice articoli non valido.")
+        name = item.get("file", "")
+        match = ARTICLE_NAME.fullmatch(name)
+        if not match or name in names or int(match[1]) in numbers:
+            raise ValueError("Nome o progressivo duplicato/non valido nell'indice articoli.")
+        names.add(name)
+        numbers.add(int(match[1]))
+    return index
+
+
+def save_index(output_dir: Path, index: dict) -> None:
+    atomic_write(output_dir / "indice.json", json.dumps(index, ensure_ascii=False, indent=2) + "\n")
+
+
+def article_path(output_dir: Path, video: Video, *, created_at: datetime | None = None) -> Path:
+    index = load_index(output_dir)
+    if video.video_id in index:
+        return output_dir / index[video.video_id]["file"]
+    numbers = [int(ARTICLE_NAME.fullmatch(item["file"])[1]) for item in index.values()]
+    numbers.extend(
+        int(match[1]) for p in output_dir.glob("*.txt") if (match := ARTICLE_NAME.fullmatch(p.name))
+    )
+    number = max(numbers, default=0) + 1
+    stamp = (created_at or datetime.now(ROME)).astimezone(ROME)
+    return output_dir / f"{number:04d}-{stamp:%Y-%m-%d-%H-%M-%S}.txt"
+
+
+def reserve_article(output_dir: Path, video: Video, *, created_at: datetime | None = None) -> Path:
+    """Registra il nome prima del testo: un arresto non perde il collegamento al video."""
+    stamp = created_at or datetime.now(ROME)
+    path = article_path(output_dir, video, created_at=stamp)
+    index = load_index(output_dir)
+    if video.video_id not in index:
+        index[video.video_id] = {
+            "file": path.name,
+            "titolo_video": video.title,
+            "pubblicato_il": video.published_at,
+            "articolo_creato_il": stamp.astimezone(ROME).isoformat(),
+        }
+        save_index(output_dir, index)
+    return path
+
+
+def rename_articles(output_dir: Path) -> int:
+    """Migra i nomi precedenti preservando testo, ID e data di creazione in Git."""
+    legacy = []
+    for path in output_dir.glob("*.txt"):
+        if ARTICLE_NAME.fullmatch(path.name):
+            continue
+        video_id = path.name[:11]
+        if not VIDEO_ID.fullmatch(video_id) or path.name[11:12] != "_":
+            raise ValueError(f"Articolo senza ID riconoscibile: {path.name}")
+        prepare_article(path.read_text(encoding="utf-8"))
+        stamp = datetime.fromtimestamp(path.stat().st_mtime, ROME)
+        result = subprocess.run(
+            ["git", "log", "--follow", "--diff-filter=A", "--format=%aI", "--", path.name],
+            cwd=output_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            stamp = datetime.fromisoformat(result.stdout.strip().splitlines()[-1]).astimezone(ROME)
+        legacy.append((stamp, path.name, path, video_id))
+    for stamp, _, path, video_id in sorted(legacy):
+        video = Video(video_id, path.read_text(encoding="utf-8").splitlines()[0])
+        target = reserve_article(output_dir, video, created_at=stamp)
+        if target.exists():
+            raise ValueError(f"Migrazione interrotta: destinazione già presente ({target.name}).")
+        path.rename(target)
+        LOG.info("Rinominato: %s → %s", path.name, target.name)
+    return len(legacy)
 
 
 def existing_article(output_dir: Path, video_id: str) -> bool:
+    item = load_index(output_dir).get(video_id)
+    if item:
+        path = output_dir / item["file"]
+        if path.is_file() and path.read_text(encoding="utf-8").strip():
+            prepare_article(path.read_text(encoding="utf-8"))
+            return True
     return any(
         p.read_text(encoding="utf-8").strip()
         for p in output_dir.glob(f"{video_id}_*.txt")
@@ -336,9 +428,40 @@ def render_article(article: str) -> str:
     return prepare_article(article) + "\n"
 
 
-def run(config: Config, *, dry_run: bool = False) -> int:
+def select_videos(videos: list[Video], video_date: date | None) -> list[Video]:
+    if video_date is None:
+        return videos
+    selected = []
+    for video in videos:
+        if not video.published_at:
+            raise ValueError(f"Data di pubblicazione mancante: {video.video_id}")
+        stamp = datetime.fromisoformat(video.published_at.replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            raise ValueError(f"Fuso orario di pubblicazione mancante: {video.video_id}")
+        if stamp.astimezone(ROME).date() == video_date:
+            selected.append(video)
+    return selected
+
+
+def run(
+    config: Config,
+    *,
+    dry_run: bool = False,
+    video_date: date | None = None,
+    latest_first: bool = False,
+) -> int:
     processed = load_processed(config.processed_file)
-    videos = [video for video in get_videos(config.feed_url) if video.video_id not in processed]
+    feed = select_videos(get_videos(config.feed_url), video_date)
+    if latest_first:
+        feed = list(reversed(feed))
+    # Un ID nello stato con file cancellato/non presente deve essere recuperato.
+    videos = [
+        video
+        for video in feed
+        if video.video_id not in processed
+        or not existing_article(config.output_dir, video.video_id)
+    ]
+    LOG.info("Filtro data: %s (Europe/Rome).", video_date or "tutto il feed")
     LOG.info(
         "Video nel feed ancora da elaborare: %d (limite per esecuzione: %d).",
         len(videos),
@@ -346,14 +469,19 @@ def run(config: Config, *, dry_run: bool = False) -> int:
     )
     if dry_run:
         for video in videos:
-            LOG.info("%s | %s | %s", video.video_id, video.title, video.url)
+            LOG.info(
+                "%s | %s | %s | %s", video.published_at, video.video_id, video.title, video.url
+            )
         return 0
-    generated = pending = failed = attempted = 0
+    generated = pending = failed = attempted = recovered = 0
+    last_generation = None
+    created_files = []
     for video in videos:
         try:
             # Recupero dopo un arresto tra il salvataggio del file e quello dello stato.
             if existing_article(config.output_dir, video.video_id):
                 mark_processed(config.processed_file, processed, video.video_id)
+                recovered += 1
                 LOG.info("%s: articolo già presente, stato recuperato.", video.video_id)
                 continue
             if attempted >= config.max_videos:
@@ -373,15 +501,30 @@ def run(config: Config, *, dry_run: bool = False) -> int:
                 )
                 transcript = None
                 source_type = "youtube_video"
-            if not transcript and source_type == "transcript":
+            if not transcript and source_type == "transcript" and not config.video_fallback:
                 pending += 1
                 continue
+            if last_generation is not None:
+                delay = config.min_generation_interval - (time.monotonic() - last_generation)
+                if delay > 0:
+                    LOG.info(
+                        "Attesa di %.0f secondi tra richieste Gemini per rispettare le quote.",
+                        delay,
+                    )
+                    while delay > 0:
+                        time.sleep(min(delay, 60))
+                        delay = config.min_generation_interval - (
+                            time.monotonic() - last_generation
+                        )
             attempted += 1
+            last_generation = time.monotonic()
             article = generate_article(video, transcript, config)
-            path = article_path(config.output_dir, video)
-            atomic_write(path, render_article(article))
+            rendered = render_article(article)
+            path = reserve_article(config.output_dir, video)
+            atomic_write(path, rendered)
             mark_processed(config.processed_file, processed, video.video_id)
             generated += 1
+            created_files.append(path.name)
             LOG.info("Articolo creato: %s", path.name)
         except errors.ClientError as exc:
             if exc.code == 429:
@@ -410,6 +553,17 @@ def run(config: Config, *, dry_run: bool = False) -> int:
     LOG.info(
         "Risultato: %d creati, %d in attesa di sottotitoli, %d errori.", generated, pending, failed
     )
+    remaining = len(videos) - generated - recovered
+    summary = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary:
+        with Path(summary).open("a", encoding="utf-8") as report:
+            report.write(
+                f"## Articoli Lazio\n\nData video: {video_date or 'tutto il feed'} (Europe/Rome).\n\n"
+                f"Creati: {generated}. In attesa di sottotitoli: {pending}. Errori: {failed}.\n\n"
+                f"Video selezionati ancora da elaborare: {remaining}.\n\n"
+            )
+            for name in created_files:
+                report.write(f"- `articoli/{name}`\n")
     return 1 if failed else 0
 
 
@@ -420,6 +574,17 @@ def main() -> int:
         action="store_true",
         help="Elenca i video nuovi senza chiamare Gemini o modificare file.",
     )
+    parser.add_argument(
+        "--date",
+        default="today",
+        metavar="today|all|AAAA-MM-GG",
+        help="Data di pubblicazione dei video in Europe/Rome (default: oggi); all include gli arretrati.",
+    )
+    parser.add_argument(
+        "--rename-articles",
+        action="store_true",
+        help="Rinomina gli articoli esistenti con progressivo-data-orario, senza usare rete o Gemini.",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     # Non abilitare i log HTTP dei provider: potrebbero contenere credenziali.
@@ -428,11 +593,25 @@ def main() -> int:
     load_dotenv(ROOT / ".env", override=False)
     try:
         config = Config.from_env()
+        video_date = (
+            datetime.now(ROME).date()
+            if args.date == "today"
+            else None
+            if args.date == "all"
+            else date.fromisoformat(args.date)
+        )
     except ValueError as exc:
         LOG.error("Configurazione: %s", exc)
         return 1
     try:
-        return run(config, dry_run=args.dry_run)
+        if args.rename_articles:
+            if args.dry_run:
+                parser.error("--rename-articles non può essere usato con --dry-run.")
+            rename_articles(config.output_dir)
+            return 0
+        return run(
+            config, dry_run=args.dry_run, video_date=video_date, latest_first=args.date == "all"
+        )
     except Exception as exc:
         LOG.error(
             "Esecuzione interrotta (%s). Verifica rete, feed e file di stato.", type(exc).__name__

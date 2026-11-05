@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -105,6 +106,7 @@ class PipelineTests(unittest.TestCase):
             "test-key",
             output_dir=self.root / "articoli",
             processed_file=self.root / "processed.txt",
+            min_generation_interval=0,
         )
         self.feed = patch.object(app, "get_videos", return_value=[V1, V2, V3]).start()
         self.transcript = patch.object(
@@ -157,6 +159,7 @@ class PipelineTests(unittest.TestCase):
             max_videos=1,
             output_dir=self.config.output_dir,
             processed_file=self.config.processed_file,
+            video_fallback=False,
         )
         self.assertEqual(app.run(config), 0)
         self.assertEqual(app.load_processed(config.processed_file), {V3.video_id})
@@ -274,6 +277,110 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(app.run(self.config), 1)
         self.assertFalse(self.config.processed_file.exists())
         self.assertFalse(self.config.output_dir.exists())
+
+    def test_today_filter_ignores_backlog(self):
+        self.feed.return_value = [V1, V2]
+        self.assertEqual(app.run(self.config, video_date=date(2026, 11, 4)), 0)
+        self.generate.assert_called_once_with(V2, "Trascrizione del video.", self.config)
+
+    def test_latest_first_does_not_spend_quota_on_backlog(self):
+        self.assertEqual(app.run(replace(self.config, max_videos=1), latest_first=True), 0)
+        self.assertEqual(self.generate.call_args.args[0], V3)
+
+    def test_missing_subtitles_also_use_video_fallback(self):
+        self.feed.return_value = [V1]
+        self.transcript.return_value = None
+        self.assertEqual(app.run(self.config), 0)
+        self.generate.assert_called_once_with(V1, None, self.config)
+
+    def test_deleted_article_is_recreated_even_if_marked_processed(self):
+        self.feed.return_value = [V1]
+        self.assertEqual(app.run(self.config), 0)
+        path = app.article_path(self.config.output_dir, V1)
+        path.unlink()
+        self.generate.reset_mock()
+        self.assertEqual(app.run(self.config), 0)
+        self.generate.assert_called_once()
+        self.assertTrue(path.is_file())
+        self.assertEqual(len(app.load_index(self.config.output_dir)), 1)
+
+    def test_interval_is_respected_between_generation_starts(self):
+        self.feed.return_value = [V1, V2]
+        with (
+            patch.object(app.time, "monotonic", side_effect=[0, 10, 60, 60]),
+            patch.object(app.time, "sleep") as sleep,
+        ):
+            self.assertEqual(app.run(replace(self.config, min_generation_interval=60)), 0)
+        sleep.assert_called_once_with(50)
+
+    def test_github_summary_reports_results(self):
+        self.feed.return_value = [V1]
+        summary = self.root / "summary.md"
+        with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+            self.assertEqual(app.run(self.config), 0)
+        text = summary.read_text()
+        self.assertIn("Creati: 1.", text)
+        self.assertIn("ancora da elaborare: 0.", text)
+        self.assertIn(app.article_path(self.config.output_dir, V1).name, text)
+
+
+class ArticleIndexTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def test_sequential_names_use_rome_time_and_survive_title_changes(self):
+        stamp = datetime.fromisoformat("2026-11-05T11:30:49+00:00")
+        first = app.reserve_article(self.root, V1, created_at=stamp)
+        second = app.reserve_article(self.root, V2, created_at=stamp)
+        self.assertEqual(first.name, "0001-2026-11-05-12-30-49.txt")
+        self.assertEqual(second.name, "0002-2026-11-05-12-30-49.txt")
+        renamed = replace(V1, title="Titolo modificato")
+        self.assertEqual(app.article_path(self.root, renamed), first)
+
+    def test_pending_reservation_can_be_reused_without_skipping_number(self):
+        first = app.reserve_article(self.root, V1)
+        self.assertFalse(app.existing_article(self.root, V1.video_id))
+        self.assertEqual(app.reserve_article(self.root, V1), first)
+        app.atomic_write(first, ARTICLE)
+        self.assertTrue(app.existing_article(self.root, V1.video_id))
+
+    def test_migration_preserves_text_and_is_idempotent(self):
+        old = self.root / f"{V1.video_id}_titolo.txt"
+        app.atomic_write(old, ARTICLE)
+        with patch.object(app.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
+            self.assertEqual(app.rename_articles(self.root), 1)
+            self.assertEqual(app.rename_articles(self.root), 0)
+        path = app.article_path(self.root, V1)
+        self.assertFalse(old.exists())
+        self.assertEqual(path.read_text(), ARTICLE)
+        self.assertTrue(app.existing_article(self.root, V1.video_id))
+
+    def test_index_rejects_path_traversal_and_duplicate_numbers(self):
+        for index in (
+            {V1.video_id: {"file": "../../outside.txt"}},
+            {
+                V1.video_id: {"file": "0001-2026-11-05-12-00-00.txt"},
+                V2.video_id: {"file": "0001-2026-11-05-13-00-00.txt"},
+            },
+        ):
+            app.save_index(self.root, index)
+            with self.assertRaises(ValueError):
+                app.load_index(self.root)
+
+
+class DateSelectionTests(unittest.TestCase):
+    def test_date_is_italian_calendar_day_across_utc_midnight(self):
+        for stamp in ("2026-11-04T23:30:00Z", "2026-07-04T22:30:00Z"):
+            video = replace(V1, published_at=stamp)
+            day = date(2026, 11, 5) if "11-" in stamp else date(2026, 7, 5)
+            self.assertEqual(app.select_videos([video], day), [video])
+
+    def test_missing_or_naive_dates_are_rejected_when_filtering(self):
+        for stamp in ("", "2026-11-05T12:00:00"):
+            with self.assertRaises(ValueError):
+                app.select_videos([replace(V1, published_at=stamp)], date(2026, 11, 5))
 
 
 class ArticleTextTests(unittest.TestCase):
